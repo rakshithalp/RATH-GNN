@@ -1,0 +1,251 @@
+"""
+Sections 4.3-4.4 - Local/edge delay models and Delay-Security-Aware PPO offloading.
+
+Eq. 2   T_local  = D * C_cyc / f_local
+Eq. 3   E_local  = kappa * (f_local)^2 * D * C_cyc
+Eq. 4   R        = B * log2(1 + P*h / (N0*B))
+Eq. 5   T_offload = T_tx + T_edge + T_queue        (M/M/1 queue: T_queue = nu / (mu*(mu-nu)))
+Eq. 6   Trust_{e,t} = (1-rho) Trust_{e,t-1} + rho * c_{e,t}
+Eq. 7   Risk_k(e,t)  = Sens_k*(1-Trust_{e,t}) + (1-Sens_k)*Vuln_e
+Eq. 8   C_k(x) = alpha*T_k(x) + beta*Risk_k(x) + gamma*max(0, Risk_k(x) - Risk_th)
+Eq. 9   s_{k,t} = (D, b, h, q, f_local_avail, {f_e_avail}, {Trust_e}, Sens_k, L, E_rem)
+Eq. 10  r_{k,t} = -C_k(a_{k,t})
+Eq. 11  L^CLIP(theta) = E[min(rho_t(theta) A_hat, clip(rho_t(theta), 1-eps, 1+eps) A_hat)]
+
+Reported configuration: actor/critic hidden layers 128-64, eps=0.20, gamma=0.99,
+GAE lambda=0.95, policy lr=3e-4, entropy coef=0.01. The paper does not preserve
+alpha/beta/gamma/rho values or the PPO rollout/episode schedule, so these are
+exposed as constructor arguments rather than hard-coded guesses.
+"""
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass, field
+from typing import Dict, List, Tuple
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+# ----------------------------- Eq. 2-5: delay/energy models -----------------------------
+
+def local_delay(D: float, C_cyc: float, f_local: float) -> float:
+    """Eq. 2."""
+    return D * C_cyc / f_local
+
+
+def local_energy(D: float, C_cyc: float, f_local: float, kappa: float = 1e-27) -> float:
+    """Eq. 3 (DVS characterization; retained as a resource descriptor, not in the reward)."""
+    return kappa * (f_local ** 2) * D * C_cyc
+
+
+def achievable_rate(B: float, P: float, h: float, N0: float) -> float:
+    """Eq. 4."""
+    return B * math.log2(1.0 + (P * h) / (N0 * B))
+
+
+def offload_delay(D: float, C_cyc: float, f_edge: float, B: float, P: float, h: float, N0: float,
+                   arrival_rate: float, service_rate: float) -> float:
+    """Eq. 5: transmission + edge compute + M/M/1 queueing delay."""
+    R = achievable_rate(B, P, h, N0)
+    T_tx = D / R
+    T_edge = D * C_cyc / f_edge
+    if arrival_rate >= service_rate:
+        T_queue = float("inf")
+    else:
+        T_queue = arrival_rate / (service_rate * (service_rate - arrival_rate))
+    return T_tx + T_edge + T_queue
+
+
+# ----------------------------- Eq. 6-8: trust, risk, cost -----------------------------
+
+class TrustModel:
+    """Eq. 6: exponentially-weighted trust update per candidate execution environment e."""
+
+    def __init__(self, environments: List[str], rho: float = 0.1, init: float = 0.5):
+        self.rho = rho
+        self.trust: Dict[str, float] = {e: init for e in environments}
+
+    def update(self, env: str, compliance_obs: float) -> float:
+        c = min(max(compliance_obs, 0.0), 1.0)
+        self.trust[env] = (1 - self.rho) * self.trust[env] + self.rho * c
+        return self.trust[env]
+
+
+def risk(sens_k: float, trust_e: float, vuln_e: float) -> float:
+    """Eq. 7."""
+    return sens_k * (1 - trust_e) + (1 - sens_k) * vuln_e
+
+
+def joint_cost(alpha: float, beta: float, gamma: float, T: float, Risk: float, risk_th: float) -> float:
+    """Eq. 8."""
+    return alpha * T + beta * Risk + gamma * max(0.0, Risk - risk_th)
+
+
+# ----------------------------- Eq. 9: broker state -----------------------------
+
+@dataclass
+class BrokerState:
+    """Eq. 9 fields, flattened to a fixed-size vector for the policy network."""
+    D: float
+    bandwidth: float
+    channel_gain: float
+    queue_len: float
+    f_local_avail: float
+    f_edge_avail: List[float] = field(default_factory=list)   # one per candidate edge env
+    trust: List[float] = field(default_factory=list)          # one per candidate edge env
+    sens: float = 0.5
+    deadline: float = 1.0
+    energy_rem: float = 1.0
+    n_edge_envs: int = 1  # fixed at construction time so the vector has constant length
+
+    def to_tensor(self) -> torch.Tensor:
+        f_edge = (self.f_edge_avail + [0.0] * self.n_edge_envs)[: self.n_edge_envs]
+        trust = (self.trust + [0.0] * self.n_edge_envs)[: self.n_edge_envs]
+        vec = [self.D, self.bandwidth, self.channel_gain, self.queue_len, self.f_local_avail,
+               *f_edge, *trust, self.sens, self.deadline, self.energy_rem]
+        return torch.tensor(vec, dtype=torch.float32)
+
+    @property
+    def dim(self) -> int:
+        return 5 + 2 * self.n_edge_envs + 3
+
+
+ACTIONS = ["local", "edge"]  # a_{k,t} in {local, edge}
+
+
+# ----------------------------- Actor-critic + PPO (Eq. 10-11) -----------------------------
+
+class ActorCritic(nn.Module):
+    """Actor/critic hidden layers of 128-64 units (reported configuration)."""
+
+    def __init__(self, state_dim: int, n_actions: int = len(ACTIONS)):
+        super().__init__()
+        self.body = nn.Sequential(
+            nn.Linear(state_dim, 128), nn.Tanh(),
+            nn.Linear(128, 64), nn.Tanh(),
+        )
+        self.policy_head = nn.Linear(64, n_actions)
+        self.value_head = nn.Linear(64, 1)
+
+    def forward(self, s: torch.Tensor):
+        z = self.body(s)
+        logits = self.policy_head(z)
+        value = self.value_head(z).squeeze(-1)
+        return logits, value
+
+    def act(self, s: torch.Tensor):
+        logits, value = self.forward(s)
+        dist = torch.distributions.Categorical(logits=logits)
+        a = dist.sample()
+        return a, dist.log_prob(a), value, dist.entropy()
+
+
+@dataclass
+class Transition:
+    state: torch.Tensor
+    action: int
+    log_prob: float
+    reward: float
+    value: float
+    done: bool = False
+
+
+def compute_gae(transitions: List[Transition], last_value: float, gamma: float = 0.99, lam: float = 0.95):
+    """Generalized advantage estimation feeding A_hat_{k,t} in Eq. 11."""
+    advantages = [0.0] * len(transitions)
+    gae = 0.0
+    next_value = last_value
+    for t in reversed(range(len(transitions))):
+        tr = transitions[t]
+        mask = 0.0 if tr.done else 1.0
+        delta = tr.reward + gamma * next_value * mask - tr.value
+        gae = delta + gamma * lam * mask * gae
+        advantages[t] = gae
+        next_value = tr.value
+    returns = [advantages[t] + transitions[t].value for t in range(len(transitions))]
+    return advantages, returns
+
+
+class PPOOffloadingBroker:
+    """
+    Delay-Security-Aware PPO broker (Section 4.4). Chooses local-vs-edge
+    execution per task (Eq. 9-10) and is trained with the clipped surrogate
+    objective (Eq. 11) using a soft violation penalty in the reward (Eq. 8),
+    matching the paper's note that violations are discouraged, not masked.
+    """
+
+    def __init__(
+        self,
+        state_dim: int,
+        alpha: float = 1.0,
+        beta: float = 1.0,
+        gamma_risk: float = 1.0,
+        risk_th: float = 0.30,          # Risk_th = 0.30 (Section 4.9)
+        clip_eps: float = 0.20,         # reported epsilon
+        gamma: float = 0.99,            # reported discount factor
+        gae_lambda: float = 0.95,       # reported GAE parameter
+        lr: float = 3e-4,               # reported policy learning rate
+        entropy_coef: float = 0.01,     # reported entropy coefficient
+        value_coef: float = 0.5,
+    ):
+        self.net = ActorCritic(state_dim)
+        self.optimizer = torch.optim.Adam(self.net.parameters(), lr=lr)
+        self.alpha, self.beta, self.gamma_risk, self.risk_th = alpha, beta, gamma_risk, risk_th
+        self.clip_eps = clip_eps
+        self.gamma = gamma
+        self.gae_lambda = gae_lambda
+        self.entropy_coef = entropy_coef
+        self.value_coef = value_coef
+
+    def select_action(self, state: BrokerState):
+        s = state.to_tensor()
+        with torch.no_grad():
+            a, log_prob, value, _ = self.net.act(s)
+        return ACTIONS[a.item()], a.item(), log_prob.item(), value.item(), s
+
+    def reward_for(self, action: str, T_k: float, Risk_k: float) -> float:
+        """Eq. 8 then Eq. 10: r_{k,t} = -C_k(a_{k,t})."""
+        C = joint_cost(self.alpha, self.beta, self.gamma_risk, T_k, Risk_k, self.risk_th)
+        return -C
+
+    def update(self, transitions: List[Transition], last_value: float, epochs: int = 4, minibatch: int = 64):
+        """Eq. 11: PPO-clip update over a collected rollout."""
+        if not transitions:
+            return {}
+        advantages, returns = compute_gae(transitions, last_value, self.gamma, self.gae_lambda)
+
+        states = torch.stack([t.state for t in transitions])
+        actions = torch.tensor([t.action for t in transitions])
+        old_log_probs = torch.tensor([t.log_prob for t in transitions], dtype=torch.float32)
+        advantages_t = torch.tensor(advantages, dtype=torch.float32)
+        advantages_t = (advantages_t - advantages_t.mean()) / (advantages_t.std() + 1e-8)
+        returns_t = torch.tensor(returns, dtype=torch.float32)
+
+        n = states.size(0)
+        last_metrics = {}
+        for _ in range(epochs):
+            perm = torch.randperm(n)
+            for i in range(0, n, minibatch):
+                idx = perm[i:i + minibatch]
+                logits, values = self.net(states[idx])
+                dist = torch.distributions.Categorical(logits=logits)
+                new_log_probs = dist.log_prob(actions[idx])
+
+                ratio = torch.exp(new_log_probs - old_log_probs[idx])  # rho_t(theta), Eq. 11
+                A = advantages_t[idx]
+                surr1 = ratio * A
+                surr2 = torch.clamp(ratio, 1 - self.clip_eps, 1 + self.clip_eps) * A
+                policy_loss = -torch.min(surr1, surr2).mean()  # L^CLIP, Eq. 11
+
+                value_loss = F.mse_loss(values, returns_t[idx])
+                entropy_loss = -dist.entropy().mean()
+
+                loss = policy_loss + self.value_coef * value_loss + self.entropy_coef * entropy_loss
+
+                self.optimizer.zero_grad()
+                loss.backward()
+                self.optimizer.step()
+                last_metrics = {"policy_loss": policy_loss.item(), "value_loss": value_loss.item()}
+        return last_metrics
