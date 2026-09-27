@@ -1,0 +1,125 @@
+"""
+Section 4.6 - Heterogeneous traffic graph construction.
+
+A traffic graph at observation window t is G_{k,t} = (V_t, E_t, phi, psi)
+where phi maps nodes -> node type and psi maps edges -> relation type.
+
+Node types (paper): device, flow, source_ip, dest_ip, service, gateway
+Relations (paper):  communicates_with, belongs_to_flow, requests_service,
+                     co_located_at_gateway
+
+Each snapshot is anchored to one labelled target flow; the graph-level
+prediction (Eq. 19) is trained against that target flow's ground-truth
+class.
+"""
+from __future__ import annotations
+
+import random
+from dataclasses import dataclass, field
+from typing import Dict, List, Tuple
+
+import torch
+
+NODE_TYPES = ["device", "flow", "source_ip", "dest_ip", "service", "gateway"]
+
+RELATIONS: Dict[str, Tuple[str, str]] = {
+    # relation_name: (src_node_type, dst_node_type)
+    "communicates_with": ("source_ip", "dest_ip"),
+    "belongs_to_flow": ("device", "flow"),
+    "requests_service": ("flow", "service"),
+    "co_located_at_gateway": ("device", "gateway"),
+}
+
+
+@dataclass
+class HeteroGraph:
+    """One target-flow-centred graph snapshot (Section 4.6)."""
+
+    x: Dict[str, torch.Tensor]                       # node_type -> [N_type, feat_dim]
+    edge_index: Dict[str, Tuple[torch.Tensor, torch.Tensor]]  # relation -> (src_idx, dst_idx), local to each type
+    entity_id: Dict[str, List[int]]                  # node_type -> persistent entity id per row (for Eq. 17)
+    target_type: str                                  # node type of the labelled target flow ("flow")
+    target_index: int                                 # row of the target flow inside x[target_type]
+    y: int                                             # ground-truth class of the target flow
+    window_id: int = 0
+
+
+def _rand_edges(n_src: int, n_dst: int, n_edges: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    n_edges = max(1, min(n_edges, n_src * n_dst))
+    src = torch.randint(0, n_src, (n_edges,))
+    dst = torch.randint(0, n_dst, (n_edges,))
+    return src, dst
+
+
+def build_synthetic_window(
+    feat_dim: int,
+    num_classes: int,
+    window_id: int,
+    n_devices: int = 6,
+    n_flows: int = 20,
+    n_ips: int = 8,
+    n_services: int = 5,
+    n_gateways: int = 1,
+    persistent_pool: Dict[str, List[int]] | None = None,
+) -> HeteroGraph:
+    """
+    Builds one fixed-record window (N_w records, Section 4.6) as a
+    target-flow-centred heterogeneous graph. This is a synthetic stand-in
+    for records drawn from UNSW-NB15 / CSE-CIC-IDS2018 / ToN_IoT: swap
+    `build_synthetic_window` for a loader over real preprocessed CSVs and
+    everything downstream (model, offloading, aggregation) is unchanged.
+    """
+    counts = {
+        "device": n_devices,
+        "flow": n_flows,
+        "source_ip": n_ips,
+        "dest_ip": n_ips,
+        "service": n_services,
+        "gateway": n_gateways,
+    }
+
+    x = {t: torch.randn(counts[t], feat_dim) for t in NODE_TYPES}
+
+    # Persistent entity identities: reuse ids across windows for non-transient
+    # types (device, source_ip, dest_ip, service, gateway); flow nodes are
+    # transient and get fresh ids each window (Section 4.7 temporal-state note).
+    entity_id: Dict[str, List[int]] = {}
+    persistent_pool = persistent_pool if persistent_pool is not None else {}
+    for t in NODE_TYPES:
+        if t == "flow":
+            entity_id[t] = [-1] * counts[t]  # transient: no persistent identity
+            continue
+        pool = persistent_pool.setdefault(t, list(range(counts[t])))
+        entity_id[t] = pool[: counts[t]]
+
+    edge_index = {}
+    for rel, (src_t, dst_t) in RELATIONS.items():
+        n_edges = max(counts[src_t], counts[dst_t]) * 2
+        edge_index[rel] = _rand_edges(counts[src_t], counts[dst_t], n_edges)
+
+    target_index = random.randrange(counts["flow"])
+    y = random.randrange(num_classes)
+
+    return HeteroGraph(
+        x=x,
+        edge_index=edge_index,
+        entity_id=entity_id,
+        target_type="flow",
+        target_index=target_index,
+        y=y,
+        window_id=window_id,
+    )
+
+
+def build_synthetic_sequence(
+    feat_dim: int,
+    num_classes: int,
+    n_windows: int,
+    **kwargs,
+) -> List[HeteroGraph]:
+    """A time-ordered sequence of windows for one gateway (feeds Eq. 17)."""
+    persistent_pool: Dict[str, List[int]] = {}
+    return [
+        build_synthetic_window(feat_dim, num_classes, t, persistent_pool=persistent_pool, **kwargs)
+        for t in range(n_windows)
+    ]
