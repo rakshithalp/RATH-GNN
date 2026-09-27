@@ -1,0 +1,212 @@
+"""
+Section 4.7 - RATH-GNN detector.
+
+Eq. 14  h_v^(0)      = W_phi(v) x_v + b_phi(v)                (node-type-specific projection)
+Eq. 15  alpha_uv^r,m  = softmax_u(LeakyReLU(a_r^m^T [W_r^m h_u || W_r^m h_v]))  (relation-aware attention)
+Eq. 16  h_v^(l+1)    = sigma( ||_{m=1..M} sum_r sum_{u in N_r(v)} alpha_uv^r,m W_r^m h_u^(l) )
+Eq. 17  z_v          = GRU(h_v,1^(L), ..., h_v,T^(L))          (temporal aggregation across windows)
+Eq. 18  beta_v = softmax_v(u^T tanh(W_p z_v + b_p)); z_G = sum_v beta_v z_v  (attention pooling)
+Eq. 19  y_hat = softmax(W_c z_G + b_c)                         (classification head)
+
+Reported configuration: L = 2 layers, M = 4 attention heads, hidden dim 128.
+"""
+from __future__ import annotations
+
+from typing import Dict, List, Tuple
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from .graph import HeteroGraph, NODE_TYPES, RELATIONS
+
+
+def scatter_softmax(scores: torch.Tensor, index: torch.Tensor, num_nodes: int) -> torch.Tensor:
+    """Softmax of `scores` [E, heads] grouped by destination node `index` [E].
+
+    This is the `softmax_u` in Eq. 15: for a fixed target v, normalize the
+    attention scores over its incoming neighbours u.
+    """
+    if scores.numel() == 0:
+        return scores
+    # numerically stable: subtract per-group max
+    group_max = torch.full((num_nodes, scores.size(1)), float("-inf"), device=scores.device)
+    group_max = group_max.index_reduce(0, index, scores, "amax", include_self=True)
+    scores = scores - group_max[index]
+    exp = scores.exp()
+    denom = torch.zeros(num_nodes, scores.size(1), device=scores.device)
+    denom.index_add_(0, index, exp)
+    denom = denom.clamp_min(1e-16)
+    return exp / denom[index]
+
+
+def scatter_sum(values: torch.Tensor, index: torch.Tensor, num_nodes: int) -> torch.Tensor:
+    out_shape = (num_nodes,) + values.shape[1:]
+    out = torch.zeros(out_shape, device=values.device, dtype=values.dtype)
+    out.index_add_(0, index, values)
+    return out
+
+
+class RelationAttention(nn.Module):
+    """One relation r's multi-head attention (Eq. 15-16, summed over its own neighbours)."""
+
+    def __init__(self, hidden_dim: int, n_heads: int):
+        super().__init__()
+        assert hidden_dim % n_heads == 0
+        self.n_heads = n_heads
+        self.head_dim = hidden_dim // n_heads
+        self.W = nn.Linear(hidden_dim, hidden_dim, bias=False)  # W_r^m, all heads packed
+        self.att = nn.Parameter(torch.empty(n_heads, 2 * self.head_dim))
+        nn.init.xavier_uniform_(self.W.weight)
+        nn.init.xavier_uniform_(self.att)
+        self.leaky_relu = nn.LeakyReLU(0.2)
+
+    def forward(
+        self,
+        h_src: torch.Tensor,
+        h_dst: torch.Tensor,
+        edge_index: Tuple[torch.Tensor, torch.Tensor],
+    ) -> torch.Tensor:
+        src, dst = edge_index
+        n_dst = h_dst.size(0)
+        if src.numel() == 0:
+            return torch.zeros(n_dst, self.n_heads * self.head_dim, device=h_dst.device)
+
+        Wh_src = self.W(h_src).view(-1, self.n_heads, self.head_dim)  # [N_src, M, d]
+        Wh_dst = self.W(h_dst).view(-1, self.n_heads, self.head_dim)  # [N_dst, M, d]
+
+        Wh_u = Wh_src[src]  # [E, M, d]
+        Wh_v = Wh_dst[dst]  # [E, M, d]
+        cat = torch.cat([Wh_u, Wh_v], dim=-1)  # [E, M, 2d]
+        e = self.leaky_relu((cat * self.att.unsqueeze(0)).sum(-1))  # [E, M]
+
+        alpha = scatter_softmax(e, dst, n_dst)  # [E, M]  -- softmax_u for each fixed v
+
+        weighted = alpha.unsqueeze(-1) * Wh_u  # [E, M, d]
+        out = scatter_sum(weighted, dst, n_dst)  # [N_dst, M, d]
+        return out.reshape(n_dst, self.n_heads * self.head_dim)
+
+
+class RATHGNNLayer(nn.Module):
+    """One heterogeneous message-passing layer: relation-specific attention,
+    summed across relations sharing a destination type, then Eq. 16's sigma."""
+
+    def __init__(self, hidden_dim: int, n_heads: int, relations=RELATIONS):
+        super().__init__()
+        self.relations = relations
+        self.rel_attn = nn.ModuleDict({rel: RelationAttention(hidden_dim, n_heads) for rel in relations})
+        self.sigma = nn.ReLU()
+
+    def forward(
+        self,
+        h: Dict[str, torch.Tensor],
+        edge_index: Dict[str, Tuple[torch.Tensor, torch.Tensor]],
+    ) -> Dict[str, torch.Tensor]:
+        agg = {t: torch.zeros_like(h[t]) for t in h}
+        for rel, (src_t, dst_t) in self.relations.items():
+            out = self.rel_attn[rel](h[src_t], h[dst_t], edge_index[rel])
+            agg[dst_t] = agg[dst_t] + out
+        return {t: self.sigma(agg[t]) for t in h}
+
+
+class TemporalAggregator(nn.Module):
+    """Eq. 17: z_v = GRU(h_v,1^(L), ..., h_v,T^(L)) over persistent-entity embeddings."""
+
+    def __init__(self, hidden_dim: int):
+        super().__init__()
+        self.gru = nn.GRU(input_size=hidden_dim, hidden_size=hidden_dim, batch_first=True)
+
+    def forward(self, seq: torch.Tensor) -> torch.Tensor:
+        # seq: [n_entities, T, hidden_dim], causal (no window later than t)
+        if seq.size(1) == 1:
+            return seq[:, 0, :]
+        out, _ = self.gru(seq)
+        return out[:, -1, :]
+
+
+class AttentionPooling(nn.Module):
+    """Eq. 18: beta_v = softmax_v(u^T tanh(W_p z_v + b_p)); z_G = sum_v beta_v z_v."""
+
+    def __init__(self, hidden_dim: int):
+        super().__init__()
+        self.W_p = nn.Linear(hidden_dim, hidden_dim)
+        self.u = nn.Parameter(torch.empty(hidden_dim))
+        nn.init.xavier_uniform_(self.u.unsqueeze(0))
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        # z: [n_nodes, hidden_dim] for one graph's node set V_t
+        scores = torch.tanh(self.W_p(z)) @ self.u  # [n_nodes]
+        beta = F.softmax(scores, dim=0)
+        z_G = (beta.unsqueeze(-1) * z).sum(0)
+        return z_G
+
+
+class RATHGNN(nn.Module):
+    """Full detector: Eq. 14 -> [Eq. 15-16] x L -> Eq. 17 -> Eq. 18 -> Eq. 19."""
+
+    def __init__(
+        self,
+        feat_dim: int,
+        hidden_dim: int = 128,
+        n_layers: int = 2,
+        n_heads: int = 4,
+        n_classes: int = 10,
+        node_types=NODE_TYPES,
+        relations=RELATIONS,
+    ):
+        super().__init__()
+        self.node_types = node_types
+        self.proj = nn.ModuleDict({t: nn.Linear(feat_dim, hidden_dim) for t in node_types})  # Eq. 14
+        self.layers = nn.ModuleList([RATHGNNLayer(hidden_dim, n_heads, relations) for _ in range(n_layers)])
+        self.temporal = TemporalAggregator(hidden_dim)  # Eq. 17
+        self.pool = AttentionPooling(hidden_dim)  # Eq. 18
+        self.classifier = nn.Linear(hidden_dim, n_classes)  # Eq. 19
+
+    def encode_window(self, graph: "HeteroGraph") -> Dict[str, torch.Tensor]:
+        """Runs Eq. 14-16 on a single snapshot, returns per-type node embeddings h^(L)."""
+        h = {t: self.proj[t](graph.x[t]) for t in self.node_types}  # Eq. 14
+        for layer in self.layers:
+            h = layer(h, graph.edge_index)  # Eq. 15-16, L times
+        return h
+
+    def forward(self, window_sequence: List["HeteroGraph"]) -> torch.Tensor:
+        """
+        window_sequence: causal, time-ordered list of snapshots for ONE gateway,
+        ending at the window containing the target flow to classify. Persistent
+        node identities (graph.entity_id) are matched across windows for Eq. 17;
+        the transient target-flow node only exists in the last window, so its
+        temporal sequence has length 1.
+        """
+        last = window_sequence[-1]
+        target_type = last.target_type
+
+        # Embeddings for the last window, all node types (used directly for pooling, Eq. 18).
+        h_last = self.encode_window(last)
+
+        # For the pooled set V_t we use the last window's node set. Where a
+        # persistent entity also appeared in earlier windows, replace its
+        # embedding with the temporally-aggregated z_v (Eq. 17); transient
+        # nodes (e.g. flow) fall back to their single-window embedding.
+        pooled_parts = []
+        for t in self.node_types:
+            embeds_by_id: Dict[int, List[torch.Tensor]] = {}
+            for g in window_sequence:
+                h_g = self.encode_window(g) if g is not last else h_last
+                for row, eid in enumerate(g.entity_id[t]):
+                    if eid == -1:
+                        continue
+                    embeds_by_id.setdefault(eid, []).append(h_g[t][row])
+
+            z_rows = []
+            for row, eid in enumerate(last.entity_id[t]):
+                if eid == -1 or eid not in embeds_by_id or len(embeds_by_id[eid]) == 1:
+                    z_rows.append(h_last[t][row])
+                else:
+                    seq = torch.stack(embeds_by_id[eid], dim=0).unsqueeze(0)  # [1, T, H]
+                    z_rows.append(self.temporal(seq)[0])
+            pooled_parts.append(torch.stack(z_rows, dim=0) if z_rows else h_last[t])
+
+        z_all = torch.cat(pooled_parts, dim=0)  # V_t across all node types
+        z_G = self.pool(z_all)  # Eq. 18
+        logits = self.classifier(z_G)  # Eq. 19 (pre-softmax; use CrossEntropyLoss for training)
+        return logits
