@@ -1,0 +1,123 @@
+"""
+End-to-end demo wiring the four components together, following the
+"Operational workflow" in Section 4.1:
+
+  (1) each gateway acquires local traffic records
+  (2) locally available fields are preprocessed              [-> graph.py features]
+  (3) a target-flow-centred heterogeneous graph is constructed [-> graph.py]
+  (4) the RATH-GNN performs local inference / local training   [-> model.py]
+  (5) the PPO broker selects local or edge execution           [-> offloading.py]
+  (6) selected FL clients produce local model contributions    [-> federated.local_update]
+  (7) the server forms the round reference + consensus screen  [-> federated.ConsensusScreenedAggregator]
+  (8) retained local parameters are aggregated (Eq. 21)
+  (9) the updated global detector is redistributed
+
+This uses synthetic traffic (see graph.build_synthetic_sequence) so it runs
+anywhere without the UNSW-NB15 / CSE-CIC-IDS2018 / ToN_IoT datasets. Swap in
+a real preprocessed loader that yields the same HeteroGraph structure and the
+rest of the pipeline is unchanged. Sizes below are trimmed for a fast demo;
+the reported experimental configuration (K=10, 100 rounds, 60% participation,
+5 local epochs, batch 64, lr 1e-3) is passed explicitly so it's easy to dial
+back up.
+"""
+from __future__ import annotations
+
+import copy
+import random
+from typing import Dict, List
+
+import torch
+
+from .federated import ConsensusScreenedAggregator, get_flat_params, local_update, set_flat_params
+from .graph import build_synthetic_sequence
+from .model import RATHGNN
+from .offloading import BrokerState, PPOOffloadingBroker, Transition, joint_cost, local_delay, offload_delay, risk
+
+
+def run_federated_demo(
+    n_gateways: int = 10,           # K = 10 (Section 4.9)
+    n_rounds: int = 3,              # paper: 100 -- trimmed for a fast demo
+    client_participation: float = 0.6,  # 60% client participation (6 of 10)
+    local_epochs: int = 2,          # paper: 5 -- trimmed for a fast demo
+    lr: float = 1e-3,               # reported learning rate
+    feat_dim: int = 16,
+    hidden_dim: int = 32,           # paper: 128 -- trimmed for a fast demo
+    n_heads: int = 4,               # reported M = 4
+    n_layers: int = 2,              # reported L = 2
+    n_classes: int = 5,
+    n_windows: int = 2,             # snapshots per client per round, feeds Eq. 17
+    sim_min: float = -1.0,          # not numerically specified in the paper; -1.0 retains all here
+    seed: int = 0,
+) -> Dict:
+    random.seed(seed)
+    torch.manual_seed(seed)
+
+    n_selected = max(1, round(n_gateways * client_participation))
+
+    global_model = RATHGNN(feat_dim, hidden_dim, n_layers, n_heads, n_classes)
+    global_params = get_flat_params(global_model)
+
+    aggregator = ConsensusScreenedAggregator(sim_min=sim_min)
+    broker = PPOOffloadingBroker(state_dim=BrokerState(0, 0, 0, 0, 0, n_edge_envs=1).dim)
+
+    history = []
+
+    for t in range(n_rounds):
+        selected = random.sample(range(n_gateways), n_selected)  # step 5's clients for this round
+
+        client_params, client_sizes = {}, {}
+        broker_transitions: List[Transition] = []
+
+        for k in selected:
+            # (1)-(3) acquire traffic, preprocess, build target-flow graphs
+            client_data = []
+            for _ in range(8):  # local dataset D_k (trimmed)
+                seq = build_synthetic_sequence(feat_dim, n_classes, n_windows)
+                client_data.append((seq, seq[-1].y))
+            client_sizes[k] = len(client_data)
+
+            # (5) PPO broker decides local vs. edge execution for this gateway's task
+            state = BrokerState(
+                D=random.uniform(1e6, 5e6), bandwidth=20e6, channel_gain=1e-6, queue_len=random.uniform(0, 5),
+                f_local_avail=2e9, f_edge_avail=[15e9], trust=[broker.net.value_head.bias.item() * 0 + 0.7],
+                sens=random.uniform(0.2, 0.8), deadline=1.0, energy_rem=1.0, n_edge_envs=1,
+            )
+            action, action_idx, log_prob, value, s_tensor = broker.select_action(state)
+
+            if action == "local":
+                T_k = local_delay(state.D, 1500, state.f_local_avail)
+            else:
+                T_k = offload_delay(state.D, 1500, state.f_edge_avail[0], state.bandwidth,
+                                     0.2, 1e-6, 1e-9, arrival_rate=2.0, service_rate=5.0)
+            Risk_k = risk(state.sens, state.trust[0], vuln_e=0.2)
+            reward = broker.reward_for(action, T_k, Risk_k)
+            broker_transitions.append(Transition(s_tensor, action_idx, log_prob, reward, value))
+
+            # (4) + (6) local RATH-GNN training -> local model contribution theta_k^(t+1)
+            local_model = RATHGNN(feat_dim, hidden_dim, n_layers, n_heads, n_classes)
+            set_flat_params(local_model, global_params)
+            client_params[k] = local_update(local_model, client_data, lr=lr, local_epochs=local_epochs)
+
+        # PPO update from this round's collected (state, action, reward) transitions (Eq. 11)
+        ppo_metrics = broker.update(broker_transitions, last_value=0.0, epochs=2, minibatch=8)
+
+        # (7)-(8) consensus-screened aggregation -> new global model (Eq. 20-22)
+        global_params, sims = aggregator.aggregate(global_params, client_params, client_sizes)
+
+        # (9) redistribute: next round's local models are initialized from global_params
+        history.append({
+            "round": t,
+            "selected_gateways": selected,
+            "avg_offload_reward": sum(tr.reward for tr in broker_transitions) / len(broker_transitions),
+            "similarities": sims,
+            "ppo_metrics": ppo_metrics,
+        })
+        print(f"[round {t}] gateways={selected} avg_reward={history[-1]['avg_offload_reward']:.4f} "
+              f"sims={ {k: round(v, 3) for k, v in sims.items()} }")
+
+    set_flat_params(global_model, global_params)
+    return {"model": global_model, "broker": broker, "history": history}
+
+
+if __name__ == "__main__":
+    run_federated_demo()
