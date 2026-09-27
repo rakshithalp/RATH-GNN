@@ -1,0 +1,120 @@
+"""
+Sections 4.5 and 4.8 - Federated local training and consensus-screened aggregation.
+
+Eq. 12  min_theta_k  l_k(theta_k) = (1/|D_k|) sum_{(x,y) in D_k} CE(f_theta_k(x), y)
+Eq. 13  theta_k^(tau+1) = theta_k^(tau) - eta * grad l_k(theta_k^(tau))
+Eq. 20  sim_k = (delta_theta_k . delta_theta_ref) / (||delta_theta_k|| ||delta_theta_ref||)
+Eq. 21  w_k   = |D_k| * sim_k / sum_{j in S_t} |D_j| * sim_j     for S_t = {k : sim_k >= sim_min}
+Eq. 22  theta_global^(t+1) = sum_k w_k * theta_k^(t+1)
+
+Reported configuration: K=10 gateways, 100 rounds, 60% client participation
+(6 gateways/round), 5 local epochs, batch size 64, learning rate 1e-3.
+The paper does not preserve a numeric sim_min, so it is a constructor argument.
+"""
+from __future__ import annotations
+
+from typing import Dict, List, Sequence, Tuple
+
+import torch
+import torch.nn as nn
+
+
+ParamDict = Dict[str, torch.Tensor]
+
+
+def get_flat_params(model: nn.Module) -> ParamDict:
+    return {k: v.detach().clone() for k, v in model.state_dict().items()}
+
+
+def set_flat_params(model: nn.Module, params: ParamDict) -> None:
+    model.load_state_dict(params)
+
+
+def local_update(
+    model: nn.Module,
+    dataloader: Sequence[Tuple[List, int]],
+    lr: float = 1e-3,
+    local_epochs: int = 5,
+) -> ParamDict:
+    """
+    Eq. 12-13: gateway k minimizes cross-entropy on its local labelled data
+    with plain local SGD steps. `dataloader` yields (window_sequence, label)
+    pairs consumed by RATHGNN.forward; loss uses the label carried on the
+    graph itself (see model.forward / graph.HeteroGraph.y), matched here
+    against `y_true` explicitly for clarity with Eq. 12.
+    """
+    optimizer = torch.optim.SGD(model.parameters(), lr=lr)  # Eq. 13's update rule
+    criterion = nn.CrossEntropyLoss()
+    model.train()
+    for _ in range(local_epochs):
+        for window_sequence, y_true in dataloader:
+            optimizer.zero_grad()
+            logits = model(window_sequence).unsqueeze(0)
+            loss = criterion(logits, torch.tensor([y_true]))  # Eq. 12
+            loss.backward()
+            optimizer.step()  # Eq. 13
+    return get_flat_params(model)
+
+
+def _params_to_vector(params: ParamDict, keys: List[str]) -> torch.Tensor:
+    return torch.cat([params[k].reshape(-1) for k in keys])
+
+
+def _vector_to_delta_params(base: ParamDict, updated: ParamDict) -> ParamDict:
+    return {k: updated[k] - base[k] for k in base}
+
+
+def coordinate_wise_median(deltas: List[ParamDict]) -> ParamDict:
+    """delta_theta_ref used in Eq. 20: per-parameter (coordinate-wise) median across clients."""
+    keys = deltas[0].keys()
+    ref: ParamDict = {}
+    for k in keys:
+        stacked = torch.stack([d[k] for d in deltas], dim=0)
+        ref[k] = stacked.median(dim=0).values
+    return ref
+
+
+def cosine_similarity(delta_a: ParamDict, delta_b: ParamDict) -> float:
+    """Eq. 20, with the paper's convention that a zero-norm update has sim = 0."""
+    keys = list(delta_a.keys())
+    va = _params_to_vector(delta_a, keys)
+    vb = _params_to_vector(delta_b, keys)
+    na, nb = va.norm(), vb.norm()
+    if na.item() == 0.0 or nb.item() == 0.0:
+        return 0.0
+    return (va @ vb / (na * nb)).item()
+
+
+class ConsensusScreenedAggregator:
+    """Section 4.8: directional-consensus screening + data-volume/consensus weighting."""
+
+    def __init__(self, sim_min: float = 0.0):
+        self.sim_min = sim_min  # not numerically specified in the archived record; exposed here
+
+    def aggregate(
+        self,
+        global_params: ParamDict,
+        client_params: Dict[int, ParamDict],   # gateway_id -> theta_k^(t+1)
+        client_sizes: Dict[int, int],          # gateway_id -> |D_k|
+    ) -> Tuple[ParamDict, Dict[int, float]]:
+        client_ids = list(client_params.keys())
+        deltas = {k: _vector_to_delta_params(global_params, client_params[k]) for k in client_ids}
+
+        delta_ref = coordinate_wise_median(list(deltas.values()))  # delta_theta_ref
+
+        sims = {k: cosine_similarity(deltas[k], delta_ref) for k in client_ids}  # Eq. 20
+        retained = [k for k in client_ids if sims[k] >= self.sim_min]  # S_t, Eq. 21's index set
+
+        if not retained:
+            # "If S_t is empty, the previous global model is retained."
+            return {k: v.clone() for k, v in global_params.items()}, sims
+
+        denom = sum(client_sizes[k] * sims[k] for k in retained)
+        weights = {k: (client_sizes[k] * sims[k] / denom) if denom > 0 else 0.0 for k in retained}  # Eq. 21
+
+        new_global: ParamDict = {k: torch.zeros_like(v) for k, v in global_params.items()}
+        for k in retained:
+            for pname in new_global:
+                new_global[pname] += weights[k] * client_params[k][pname]  # Eq. 22
+
+        return new_global, sims
